@@ -1,0 +1,2 @@
+This image comes from the SOTS-indoor dataset (https://sites.google.com/view/reside-dehaze-datasets/reside-standard?authuser=3D0)
+
