@@ -1,11 +1,21 @@
+from loguru import logger
 import numpy as np
 from scipy.ndimage import filters, measurements, interpolation
 from math import pi
 
 
-def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing=True, kernel_shift_flag=False):
+def imresize(
+    im,
+    scale_factor=None,
+    output_shape=None,
+    kernel=None,
+    antialiasing=True,
+    kernel_shift_flag=False,
+):
     # First standardize values and fill missing arguments (if needed) by deriving scale from output shape or vice versa
-    scale_factor, output_shape = fix_scale_and_size(im.shape, output_shape, scale_factor)
+    scale_factor, output_shape = fix_scale_and_size(
+        im.shape, output_shape, scale_factor
+    )
 
     # For a given numeric kernel case, just do convolution and sub-sampling (downscaling only)
     if type(kernel) == np.ndarray and scale_factor[0] <= 1:
@@ -18,11 +28,11 @@ def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing
         "lanczos3": (lanczos3, 6.0),
         "box": (box, 1.0),
         "linear": (linear, 2.0),
-        None: (cubic, 4.0)  # set default interpolation method as cubic
+        None: (cubic, 4.0),  # set default interpolation method as cubic
     }.get(kernel)
 
     # Antialiasing is only used when downscaling
-    antialiasing *= (scale_factor[0] < 1)
+    antialiasing *= scale_factor[0] < 1
 
     # Sort indices of dimensions according to scale of each dimension. since we are going dim by dim this is efficient
     sorted_dims = np.argsort(np.array(scale_factor)).tolist()
@@ -36,8 +46,14 @@ def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing
 
         # for each coordinate (along 1 dim), calculate which coordinates in the input image affect its result and the
         # weights that multiply the values there to get its result.
-        weights, field_of_view = contributions(im.shape[dim], output_shape[dim], scale_factor[dim],
-                                               method, kernel_width, antialiasing)
+        weights, field_of_view = contributions(
+            im.shape[dim],
+            output_shape[dim],
+            scale_factor[dim],
+            method,
+            kernel_width,
+            antialiasing,
+        )
 
         # Use the affecting position values and the set of weights to calculate the result of resizing along this 1 dim
         out_im = resize_along_dim(out_im, dim, weights, field_of_view)
@@ -60,7 +76,9 @@ def fix_scale_and_size(input_shape, output_shape, scale_factor):
     # Fixing output-shape (if given): extending it to the size of the input-shape, by assigning the original input-size
     # to all the unspecified dimensions
     if output_shape is not None:
-        output_shape = list(np.uint(np.array(output_shape))) + list(input_shape[len(output_shape):])
+        output_shape = list(np.uint(np.array(output_shape))) + list(
+            input_shape[len(output_shape) :]
+        )
 
     # Dealing with the case of non-give scale-factor, calculating according to output-shape. note that this is
     # sub-optimal, because there can be different scales to the same output-shape.
@@ -86,7 +104,7 @@ def contributions(in_length, out_length, scale, kernel, kernel_width, antialiasi
     kernel_width *= 1.0 / scale if antialiasing else 1.0
 
     # These are the coordinates of the output image
-    out_coordinates = np.arange(1, out_length+1)
+    out_coordinates = np.arange(1, out_length + 1)
 
     # These are the matching positions of the output-coordinates on the input image coordinates.
     # Best explained by example: say we have 4 horizontal pixels for HR and we downscale by SF=2 and get 2 pixels:
@@ -109,12 +127,18 @@ def contributions(in_length, out_length, scale, kernel, kernel_width, antialiasi
     # Determine a set of field_of_view for each each output position, these are the pixels in the input image
     # that the pixel in the output image 'sees'. We get a matrix whos horizontal dim is the output pixels (big) and the
     # vertical dim is the pixels it 'sees' (kernel_size + 2)
-    field_of_view = np.squeeze(np.uint(np.expand_dims(left_boundary, axis=1) + np.arange(expanded_kernel_width) - 1))
+    field_of_view = np.squeeze(
+        np.uint(
+            np.expand_dims(left_boundary, axis=1) + np.arange(expanded_kernel_width) - 1
+        )
+    )
 
     # Assign weight to each pixel in the field of view. A matrix whos horizontal dim is the output pixels and the
     # vertical dim is a list of weights matching to the pixel in the field of view (that are specified in
     # 'field_of_view')
-    weights = fixed_kernel(1.0 * np.expand_dims(match_coordinates, axis=1) - field_of_view - 1)
+    weights = fixed_kernel(
+        1.0 * np.expand_dims(match_coordinates, axis=1) - field_of_view - 1
+    )
 
     # Normalize weights to sum up to 1. be careful from dividing by 0
     sum_weights = np.sum(weights, axis=1)
@@ -122,7 +146,9 @@ def contributions(in_length, out_length, scale, kernel, kernel_width, antialiasi
     weights = 1.0 * weights / np.expand_dims(sum_weights, axis=1)
 
     # We use this mirror structure as a trick for reflection padding at the boundaries
-    mirror = np.uint(np.concatenate((np.arange(in_length), np.arange(in_length - 1, -1, step=-1))))
+    mirror = np.uint(
+        np.concatenate((np.arange(in_length), np.arange(in_length - 1, -1, step=-1)))
+    )
     field_of_view = mirror[np.mod(field_of_view, mirror.shape[0])]
 
     # Get rid of  weights and pixel positions that are of zero weight
@@ -165,8 +191,15 @@ def numeric_kernel(im, kernel, scale_factor, output_shape, kernel_shift_flag):
         out_im[:, :, channel] = filters.correlate(im[:, :, channel], kernel)
 
     # Then subsample and return
-    return out_im[np.round(np.linspace(0, im.shape[0] - 1 / scale_factor[0], output_shape[0])).astype(int)[:, None],
-                  np.round(np.linspace(0, im.shape[1] - 1 / scale_factor[1], output_shape[1])).astype(int), :]
+    return out_im[
+        np.round(
+            np.linspace(0, im.shape[0] - 1 / scale_factor[0], output_shape[0])
+        ).astype(int)[:, None],
+        np.round(
+            np.linspace(0, im.shape[1] - 1 / scale_factor[1], output_shape[1])
+        ).astype(int),
+        :,
+    ]
 
 
 def kernel_shift(kernel, sf):
@@ -183,14 +216,16 @@ def kernel_shift(kernel, sf):
     current_center_of_mass = measurements.center_of_mass(kernel)
 
     # The second ("+ 0.5 * ....") is for applying condition 2 from the comments above
-    wanted_center_of_mass = np.array(kernel.shape) / 2 + 0.5 * (sf - (kernel.shape[0] % 2))
+    wanted_center_of_mass = np.array(kernel.shape) / 2 + 0.5 * (
+        sf - (kernel.shape[0] % 2)
+    )
 
     # Define the shift vector for the kernel shifting (x,y)
     shift_vec = wanted_center_of_mass - current_center_of_mass
 
     # Before applying the shift, we first pad the kernel so that nothing is lost due to the shift
     # (biggest shift among dims + 1 for safety)
-    kernel = np.pad(kernel, np.int(np.ceil(np.max(shift_vec))) + 1, 'constant')
+    kernel = np.pad(kernel, np.int(np.ceil(np.max(shift_vec))) + 1, "constant")
 
     # Finally shift the kernel and return
     return interpolation.shift(kernel, shift_vec)
@@ -201,16 +236,18 @@ def kernel_shift(kernel, sf):
 
 def cubic(x):
     absx = np.abs(x)
-    absx2 = absx ** 2
-    absx3 = absx ** 3
-    return ((1.5*absx3 - 2.5*absx2 + 1) * (absx <= 1) +
-            (-0.5*absx3 + 2.5*absx2 - 4*absx + 2) * ((1 < absx) & (absx <= 2)))
+    absx2 = absx**2
+    absx3 = absx**3
+    return (1.5 * absx3 - 2.5 * absx2 + 1) * (absx <= 1) + (
+        -0.5 * absx3 + 2.5 * absx2 - 4 * absx + 2
+    ) * ((1 < absx) & (absx <= 2))
 
 
 def lanczos2(x):
-    return (((np.sin(pi*x) * np.sin(pi*x/2) + np.finfo(np.float32).eps) /
-             ((pi**2 * x**2 / 2) + np.finfo(np.float32).eps))
-            * (abs(x) < 2))
+    return (
+        (np.sin(pi * x) * np.sin(pi * x / 2) + np.finfo(np.float32).eps)
+        / ((pi**2 * x**2 / 2) + np.finfo(np.float32).eps)
+    ) * (abs(x) < 2)
 
 
 def box(x):
@@ -218,15 +255,37 @@ def box(x):
 
 
 def lanczos3(x):
-    return (((np.sin(pi*x) * np.sin(pi*x/3) + np.finfo(np.float32).eps) /
-            ((pi**2 * x**2 / 3) + np.finfo(np.float32).eps))
-            * (abs(x) < 3))
+    return (
+        (np.sin(pi * x) * np.sin(pi * x / 3) + np.finfo(np.float32).eps)
+        / ((pi**2 * x**2 / 3) + np.finfo(np.float32).eps)
+    ) * (abs(x) < 3)
 
 
 def linear(x):
     return (x + 1) * ((-1 <= x) & (x < 0)) + (1 - x) * ((0 <= x) & (x <= 1))
 
 
-def np_imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing=True, kernel_shift_flag=False):
-    return np.clip(imresize(im.transpose(1, 2, 0), scale_factor, output_shape, kernel, antialiasing,
-                            kernel_shift_flag).transpose(2, 0, 1), 0, 1)
+def np_imresize(
+    im,
+    scale_factor=None,
+    output_shape=None,
+    kernel=None,
+    antialiasing=True,
+    kernel_shift_flag=False,
+):
+    logger.debug(f"original shape: {im.shape}")
+
+    resized = imresize(
+        im.transpose(1, 2, 0),
+        scale_factor,
+        output_shape,
+        kernel,
+        antialiasing,
+        kernel_shift_flag,
+    )
+    logger.debug(f"Resized image shape (before transpose): {resized.shape}")
+
+    final_result = np.clip(resized.transpose(2, 0, 1), 0, 1)
+    logger.debug(f"Final image shape: {final_result.shape}")
+
+    return final_result

@@ -16,7 +16,6 @@ class StdLoss(nn.Module):
         super(StdLoss, self).__init__()
         # Get the device to use
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("Using device: ", self.device)
 
         blur = (1 / 25) * np.ones((5, 5))
         blur = blur.reshape(1, 1, blur.shape[0], blur.shape[1])

@@ -1,11 +1,10 @@
-# Simple Zero-Shot Image Dehazing (SZID) 
+# Simple Zero-Shot Image Dehazing (SZID)
 
 SZID is an image dehazing algorithm that leverages zero-shot learning principles and layer disentanglement techniques, surpassing the performance of existing models. The method uniquely operates on a single hazy image for both learning and inference, eliminating the need for extensive training datasets.
 
-Authors: J.L. Lisani, J. Navarro, U. Untzilla 
+Authors: J.L. Lisani, J. Navarro, U. Untzilla
 
 Paper submitted at ICIP2025
-
 
 ## Overview
 
@@ -19,26 +18,27 @@ The codes in folders netZID and utilsZID come from https://github.com/XLearning-
 
 ### Dependencies
 
-Create a conda environment with all the needed dependencies: 
+Create a virtual environment with all the needed dependencies:
+
 ```
-conda env create -f requirements.txt -n condaSZID
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.text
 ```
 
-Activate environment:
+### Training
+
+To launch the training, execute
+
 ```
-conda activate condaSZID
+python SZIDdehazing.py --num_iter=200 --use_gpu=True
 ```
 
 ### Testing
 
 If you want to dehaze an image you can execute
 
-```
-python SZIDdehazing.py data/hazy.png output 
-```
-
 The result will be saved as 'output_dehazed.png'. The input image will be cropped so its dimensions are multiple of 32 (requirement of the network input). The cropped input image will be saved as 'output_original.png'.
-
 
 ## Citation
 
