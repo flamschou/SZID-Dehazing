@@ -1,0 +1,14 @@
+.venvdehazing
+.DS_Store
+__pycache__
+.env
+pre_trained.ipynb
+weights/*
+I-HAZEsmall_copie/
+O-HAZEsmall_copie/
+wandb/
+test_set/
+train_set/
+val_set/
+results/
+weights_2/
