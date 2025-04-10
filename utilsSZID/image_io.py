@@ -2,10 +2,12 @@ import torch
 import numpy as np
 from PIL import Image
 
+
 def load(path):
     """Load PIL image."""
     img = Image.open(path)
     return img
+
 
 def get_image(path, imsize=-1):
     """Load an image and resize to a cpecific size.
@@ -17,7 +19,7 @@ def get_image(path, imsize=-1):
     img = load(path)
     if isinstance(imsize, int):
         imsize = (imsize, imsize)
-        
+
     if imsize[0] != -1 and img.size != imsize:
         if imsize[0] > img.size[0]:
             img = img.resize(imsize, Image.BICUBIC)
@@ -28,9 +30,11 @@ def get_image(path, imsize=-1):
 
     return img, img_np
 
+
 def prepare_hazy_image(file_name):
     img_pil = crop_image(get_image(file_name, -1)[0], d=32)
     return pil_to_np(img_pil)
+
 
 def prepare_gt_img(file_name, SOTS=True):
     if SOTS:
@@ -39,6 +43,7 @@ def prepare_gt_img(file_name, SOTS=True):
         img_pil = crop_image(get_image(file_name, -1)[0], d=32)
 
     return pil_to_np(img_pil)
+
 
 def crop_a_image(img, d=10):
     bbox = [
@@ -50,6 +55,7 @@ def crop_a_image(img, d=10):
     img_cropped = img.crop(bbox)
     return img_cropped
 
+
 def crop_image(img, d=32):
     """
     Make dimensions divisible by d
@@ -59,8 +65,7 @@ def crop_image(img, d=32):
     :return:
     """
 
-    new_size = (img.size[0] - img.size[0] % d,
-                img.size[1] - img.size[1] % d)
+    new_size = (img.size[0] - img.size[0] % d, img.size[1] - img.size[1] % d)
 
     bbox = [
         int((img.size[0] - new_size[0]) / 2),
@@ -71,6 +76,7 @@ def crop_image(img, d=32):
 
     img_cropped = img.crop(bbox)
     return img_cropped
+
 
 def pil_to_np(img_PIL, with_transpose=True):
     """
@@ -88,7 +94,8 @@ def pil_to_np(img_PIL, with_transpose=True):
         else:
             ar = ar[None, ...]
 
-    return ar.astype(np.float32) / 255.
+    return ar.astype(np.float32) / 255.0
+
 
 def np_to_pil(img_np):
     """
@@ -108,6 +115,7 @@ def np_to_pil(img_np):
 
     return Image.fromarray(ar)
 
+
 def np_to_torch(img_np):
     """
     Converts image in numpy.array to torch.Tensor.
@@ -119,6 +127,7 @@ def np_to_torch(img_np):
     """
     return torch.from_numpy(img_np)[None, :]
 
+
 def torch_to_np(img_var):
     """
     Converts an image in torch.Tensor format to np.array.
@@ -128,9 +137,8 @@ def torch_to_np(img_var):
     :return:
     """
     return img_var.detach().cpu().numpy()[0]
-    
+
+
 def save_image(name, image_np):
     p = np_to_pil(image_np)
     p.save("{}.png".format(name))
-
-
