@@ -3,17 +3,12 @@
 __pycache__
 .env
 pre_trained.ipynb
-weights/*
 I-HAZEsmall_copie/
 O-HAZEsmall_copie/
 wandb/
 test_set/
 train_set/
 val_set/
-weights_2/
-weights_3/
-weights_4/
-weights_5/
 DHQ/
 train_set_DHQ/
 IHAZE/
