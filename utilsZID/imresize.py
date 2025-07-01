@@ -1,4 +1,3 @@
-from loguru import logger
 import numpy as np
 from scipy.ndimage import filters, measurements, interpolation
 from math import pi
@@ -273,8 +272,6 @@ def np_imresize(
     antialiasing=True,
     kernel_shift_flag=False,
 ):
-    logger.debug(f"original shape: {im.shape}")
-
     resized = imresize(
         im.transpose(1, 2, 0),
         scale_factor,
@@ -283,9 +280,7 @@ def np_imresize(
         antialiasing,
         kernel_shift_flag,
     )
-    logger.debug(f"Resized image shape (before transpose): {resized.shape}")
 
     final_result = np.clip(resized.transpose(2, 0, 1), 0, 1)
-    logger.debug(f"Final image shape: {final_result.shape}")
 
     return final_result

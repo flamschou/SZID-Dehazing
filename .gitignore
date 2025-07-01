@@ -10,8 +10,12 @@ wandb/
 test_set/
 train_set/
 val_set/
-results/
 weights_2/
 weights_3/
 weights_4/
 weights_5/
+DHQ/
+train_set_DHQ/
+IHAZE/
+metrics.json
+mprofile_20250519124731.dat

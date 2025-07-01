@@ -3,7 +3,6 @@ import os
 from typing import Any, Dict, List, Optional
 from cv2.ximgproc import guidedFilter
 from loguru import logger
-import wandb
 from netZID.losses import StdLoss
 from netZID.skip_model import skip
 from utilsSZID.image_io import (
@@ -20,9 +19,9 @@ from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 from skimage.metrics import structural_similarity as compare_ssim
 import torch
 import numpy as np
-import random
 from tqdm import tqdm
 import plotly.graph_objects as go
+import json
 
 
 import argparse
@@ -49,6 +48,8 @@ class Dehaze(object):
         save_image_net: bool = False,
         path_save_nets: Optional[str] = None,
         save_weights_epochs: bool = False,
+        path_save_weights: Optional[str] = None,
+        original_version: bool = True,
     ):
         self.list_image_name = list_image_name
         self.list_image = list_image
@@ -71,14 +72,18 @@ class Dehaze(object):
         self.save_image_net = save_image_net
         self.path_save_nets = path_save_nets
         self.save_weights_epochs = save_weights_epochs
+        self.path_save_weights = path_save_weights
 
         self.storage_train_results = []
         self.storage_val_results = []
+        self.original_version = original_version
 
         # Determine device to use
         if use_gpu is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
+            if use_gpu and not torch.cuda.is_available():
+                logger.warning("GPU is not available, using CPU")
             self.device = torch.device(
                 "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
             )
@@ -185,6 +190,12 @@ class Dehaze(object):
                 np_to_torch(image).to(self.device) for image in self.list_val_img
             ]
 
+    def _init_optimizer(self):
+        self.optimizer = torch.optim.Adam(
+            self.parameters,
+            lr=self.learning_rate,
+        )
+
     def _init_all(self):
         self._init_images()
         self._init_nets()
@@ -192,26 +203,32 @@ class Dehaze(object):
         self._init_inputs()
         self._init_parameters()
         self._init_loss()
+        self._init_optimizer()
 
     def optimize(self):
         if self.device.type == "cuda":
             torch.backends.cudnn.enabled = True
             torch.backends.cudnn.benchmark = True
 
-        optimizer = torch.optim.Adam(self.parameters, lr=self.learning_rate)
-        for j in tqdm(range(self.num_iter)):
-            optimizer.zero_grad()
+        for j in tqdm(range(self.num_iter), desc="Training"):
+            self.optimizer.zero_grad()
             self._optimization_closure()
             self._obtain_current_result(j)
             self._plot_closure(j)
             if self.list_val_img is not None:
                 self._evaluate()
             if self.save_weights_epochs:
-                self.save_weights(
-                    path="weights_5/weights",
-                    epoch=j,
-                )
-            optimizer.step()
+                if self.path_save_weights is not None:
+                    self.save_weights(
+                        self.path_save_weights,
+                        epoch=j,
+                    )
+                else:
+                    self.save_weights(
+                        path="weights_5/weights",
+                        epoch=j,
+                    )
+            self.optimizer.step()
 
     def _optimization_closure(self):
         # Forward passes
@@ -223,19 +240,15 @@ class Dehaze(object):
             self.ambient_net(ambient_net_input)
             for ambient_net_input in self.list_ambient_net_input
         ]
-
         self.list_mask_out = [
             self.mask_net(mask_net_inputs)
             for mask_net_inputs in self.list_mask_net_inputs
         ]
-
         # Loss calculations
         lambda1, lambda2, lambda3, lambda4 = 200, 80000, 240, 1
-
         # Calculate blur loss - use torch.stack instead of torch.tensor
         blur_losses = [self.blur_loss(mask_out) for mask_out in self.list_mask_out]
         self.list_blur_out = torch.stack(blur_losses)
-
         # Calculate MSE losses
         mse_losses = []
         for mask_out, image_out, ambient_out, image_torch in zip(
@@ -251,27 +264,22 @@ class Dehaze(object):
                     mask_out * image_out + (1 - mask_out) * ambient_out, image_torch
                 )
             )
-
         # Use torch.stack instead of torch.tensor
         self.list_mse_loss = torch.stack(mse_losses)
-
         # Calculate total loss components
         self.list_total_loss = lambda1 * self.list_mse_loss
         self.list_total_loss += lambda2 * self.list_blur_out
-
         # Calculate DCP priors and losses
         list_dcp_prior = [
             torch.min(image_out.permute(0, 2, 3, 1), dim=3)[0]
             for image_out in self.list_image_out
         ]
-
         dcp_losses = [
             self.mse_loss(dcp_prior, torch.zeros_like(dcp_prior))
             for dcp_prior in list_dcp_prior
         ]
         self.list_dcp_loss = torch.stack(dcp_losses)
         self.list_total_loss += lambda4 * self.list_dcp_loss
-
         # Calculate angular losses
         angular_losses = [
             self.angular_loss(image_out, image_torch)
@@ -281,12 +289,9 @@ class Dehaze(object):
         ]
         self.angular_loss_value = torch.stack(angular_losses)
         self.list_total_loss += lambda3 * self.angular_loss_value
-
         # Sum all losses
         self.total_loss = self.list_total_loss.sum()
-
         self.mean_total_loss = self.list_total_loss.mean()
-
         # Perform backpropagation on the total loss
         self.total_loss.backward()
 
@@ -305,12 +310,15 @@ class Dehaze(object):
 
         posts = []
 
-        for image, mask_out_np, ambient_out_np in zip(
-            self.list_image, list_mask_out_np, list_ambient_out_np
+        for image, mask_out_np, ambient_out_np, image_out in zip(
+            self.list_image, list_mask_out_np, list_ambient_out_np, list_image_out_np
         ):
-            post = np.clip(
-                (image - ((1 - mask_out_np) * ambient_out_np)) / mask_out_np, 0, 1
-            )
+            if self.original_version:
+                post = np.clip(
+                    (image - ((1 - mask_out_np) * ambient_out_np)) / mask_out_np, 0, 1
+                )
+            else:
+                post = np.clip(image_out, 0, 1)
             posts.append(post)
 
         list_psnr = []
@@ -649,7 +657,9 @@ class Dehaze(object):
                 self.list_current_result, self.array_originals_image
             )
         ]
-        logger.debug(f"number original images: {len(self.array_originals_image)}")
+        list_image_out_np = [
+            np.clip(torch_to_np(image_out), 0, 1) for image_out in self.list_image_out
+        ]
         self.list_final_a = [
             np_imresize(current_result.a, output_shape=original_image.shape[1:])
             for current_result, original_image in zip(
@@ -657,18 +667,25 @@ class Dehaze(object):
             )
         ]
         list_mask_out_np = self.t_matting(self.list_final_t_map)
-        list_post = [
-            np.clip(
-                (original_image - ((1 - mask_out_np) * final_a)) / mask_out_np,
-                0,
-                1,
-            )
-            for original_image, mask_out_np, final_a in zip(
-                self.array_originals_image, list_mask_out_np, self.list_final_a
-            )
-        ]
+        if self.original_version:
+            list_post = [
+                np.clip(
+                    (original_image - ((1 - mask_out_np) * final_a)) / mask_out_np,
+                    0,
+                    1,
+                )
+                for original_image, mask_out_np, final_a in zip(
+                    self.array_originals_image, list_mask_out_np, self.list_final_a
+                )
+            ]
+        else:
+            list_post = [
+                np.clip(original_image_out, 0, 1)
+                for original_image_out in list_image_out_np
+            ]
 
         for image_name, post in zip(self.list_image_name, list_post):
+            logger.info(f"Image dehazed saved in results/{image_name}_dehazed.png")
             save_image(f"results/{image_name}_dehazed", post)
 
     def t_matting(self, list_mask_out_np, validation: bool = False):
@@ -708,8 +725,7 @@ class Dehaze(object):
         additional_info: Optional[str] = None,
     ):
         """
-        Save model weights to disk.
-
+        Save model weights and optimizer state to disk.
         Args:
             path (str): Base path to save the weights.
             epoch (int, optional): Current epoch number to include in filename.
@@ -720,85 +736,76 @@ class Dehaze(object):
 
         if path is None:
             path = "weights/weights"
-
         os.makedirs(
             os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True
         )
-
         # Construct filename
         filename = path
         if epoch is not None:
             filename = f"{path}_epoch_{epoch}"
-
         # Prepare state dictionary with all networks
-
         state_dict: Dict[str, Any] = {
             "image_net": self.image_net.state_dict(),
             "mask_net": self.mask_net.state_dict(),
             "ambient_net": self.ambient_net.state_dict(),
         }
+        # Save optimizer state
+        if hasattr(self, "optimizer"):
+            state_dict["optimizer_state"] = self.optimizer.state_dict()
 
         # Add optimization info if available
         state_dict["learning_rate"] = self.learning_rate
-
         # Add additional info
         if additional_info:
             state_dict["additional_info"] = additional_info
-
         # Save to disk
         torch.save(state_dict, f"{filename}.pth")
-        logger.info(f"Model weights saved to {filename}.pth")
+        logger.info(f"Model weights and optimizer state saved to {filename}.pth")
 
     def load_weights(
-        self, path: str = "weights/weights.pth", strict=True, eval_mode=False
+        self,
+        path: str = "weights/weights.pth",
+        strict=True,
+        eval_mode=False,
     ):
         """
-        Load model weights from disk.
-
+        Load model weights and optimizer state from disk.
         Args:
             path (str): Path to the saved weights file.
             strict (bool): Whether to strictly enforce that the keys in state_dict match
-                          the keys returned by this module's state_dict() function.
-
+                        the keys returned by this module's state_dict() function.
         Returns:
             dict: Additional info that was stored with the weights, if any.
         """
         if not os.path.exists(path):
             raise FileNotFoundError(f"Weights file not found at {path}")
-
         # Load state dict
         checkpoint = torch.load(path, map_location=self.device)
-
         # Load network weights
         if "image_net" in checkpoint and self.image_net is not None:
             self.image_net.load_state_dict(checkpoint["image_net"], strict=strict)
-            logger.info(f"Image net weights loaded from {path}")
         if "mask_net" in checkpoint and self.mask_net is not None:
             self.mask_net.load_state_dict(checkpoint["mask_net"], strict=strict)
-            logger.info(f"Mask net weights loaded from {path}")
         if "ambient_net" in checkpoint and self.ambient_net is not None:
-            logger.info(
-                f"Keys of ambient_net in checkpoint: {list(checkpoint['ambient_net'].keys())}"
-            )
             try:
                 self.ambient_net.load_state_dict(
                     checkpoint["ambient_net"], strict=strict
                 )
-                logger.info(f"Ambient net weights loaded from {path}")
             except Exception as e:
                 logger.error(f"Error loading ambient net weights: {e}")
                 raise e
 
+        # Load optimizer state if available and optimizer exists
+        if "optimizer_state" in checkpoint and hasattr(self, "optimizer"):
+            self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+
         # Update learning rate if saved
         if "learning_rate" in checkpoint:
             self.learning_rate = checkpoint["learning_rate"]
-
         # Re-initialize parameters to include loaded models
         self._init_parameters()
 
-        if not eval_mode:
-            logger.info(f"Model weights loaded from {path}")
-
+        logger.info(f"Model weights loaded from {path} successfully")
         # Return any additional info that was stored
         return checkpoint.get("additional_info", None)
 
@@ -808,866 +815,40 @@ def count_trainable_parameters(model):
     return total_params
 
 
-# def dehaze(image, gt_img, nameout, num_iter=200, use_gpu=None):
-#     dh = Dehaze(nameout, image, gt_img, num_iter, clip=True, use_gpu=use_gpu)
-
-#     dh.optimize()
-#     dh.finalize()
-
-#     save_image(nameout + "_original", np.clip(image, 0, 1))
-
-#     if gt_img.size != 0:
-#         psnr = dh.current_result.psnr
-#         ssim = dh.temp.ssim
-#         print(psnr, ssim)
-
-#     params_image_net = count_trainable_parameters(dh.image_net)
-#     params_mask_net = count_trainable_parameters(dh.mask_net)
-#     params_ambient_net = count_trainable_parameters(dh.ambient_net)
-
-#     total_params = params_image_net + params_mask_net + params_ambient_net
-
-#     print("J-Net parameters: %d" % params_image_net)
-#     print("T-Net parameters: %d" % params_mask_net)
-#     print("A-Net parameters: %d" % params_ambient_net)
-#     print("SZID parameters: %d" % total_params)
-
-
-# def training(num_iter=200, use_gpu=True):
-#     train = os.listdir("train_set/hazy/")
-#     list_hazy_imgs = []
-#     list_gt_imgs = []
-
-#     for image in train:
-#         list_hazy_imgs.append(prepare_hazy_image("train_set/hazy/" + image))
-#         list_gt_imgs.append(
-#             prepare_gt_img("train_set/GT/" + image[:-9] + "_GT.jpg", SOTS=False)
-#         )
-
-#     train_results = {}
-#     results = {}
-#     val = os.listdir("val_set/hazy/")
-#     list_val_imgs = []
-#     list__val_gt_imgs = []
-
-#     for image in val:
-#         list_val_imgs.append(prepare_hazy_image("val_set/hazy/" + image))
-#         list__val_gt_imgs.append(
-#             prepare_gt_img("val_set/GT/" + image[:-9] + "_GT.jpg", SOTS=False)
-#         )
-
-#     dehaze = Dehaze(
-#         [image for image in train],
-#         list_hazy_imgs,
-#         list_gt_imgs,
-#         list_val_imgs,
-#         list__val_gt_imgs,
-#         num_iter=num_iter,
-#         clip=True,
-#         use_gpu=use_gpu,
-#         save_weights_epochs=True,
-#     )
-#     dehaze.optimize()
-
-#     # I want to plot the results
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["total_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Total loss",
-#         )
-#     )
-#     # I want to save the plot in results/loss_plot in the format png
-#     os.makedirs("results/plot", exist_ok=True)
-#     fig.write_image("results/plot/training_total_loss.png")
-
-#     # I want to plot the validation results
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["total_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Total loss",
-#         )
-#     )
-
-#     fig.write_image("results/plot/validation_total_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["total_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Total loss",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["total_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Total loss",
-#         )
-#     )
-#     fig.write_image("results/plot/total_loss.png")
-
-#     # i want to do the same for ssim and psnr and angular loss and mse loss and blur loss and dcp loss
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["ssim"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="SSIM",
-#         )
-#     )
-#     fig.write_image("results/plot/training_ssim.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["ssim"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="SSIM",
-#         )
-#     )
-#     fig.write_image("results/plot/validation_ssim.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["ssim"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="SSIM",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["ssim"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="SSIM",
-#         )
-#     )
-#     fig.write_image("results/plot/ssim.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["psnr"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="PSNR",
-#         )
-#     )
-#     fig.write_image("results/plot/training_psnr.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["psnr"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="PSNR",
-#         )
-#     )
-#     fig.write_image("results/plot/validation_psnr.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["psnr"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="PSNR",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["psnr"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="PSNR",
-#         )
-#     )
-#     fig.write_image("results/plot/psnr.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["angular_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Angular Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/training_angular_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["angular_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Angular Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/validation_angular_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["angular_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Angular Loss",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["angular_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Angular Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/angular_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["mse_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="MSE Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/training_mse_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["mse_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="MSE Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/validation_mse_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["mse_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="MSE Loss",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["mse_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="MSE Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/mse_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["blur_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Blur Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/training_blur_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["blur_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Blur Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/validation_blur_loss.png")
-
-#     fig = go.Figure()
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["blur_loss"] for result in dehaze.storage_train_results],
-#             mode="lines",
-#             name="Blur Loss",
-#         )
-#     )
-#     fig.add_trace(
-#         go.Scatter(
-#             x=[i for i in range(num_iter)],
-#             y=[result["blur_loss"] for result in dehaze.storage_val_results],
-#             mode="lines",
-#             name="Blur Loss",
-#         )
-#     )
-#     fig.write_image("results/plot/blur_loss.png")
-
-#     # Now I want to load the weights of 5, 10, 15, 20, 25, 50, 100, 150 epochs and evaluate the model on the validation set
-
-#     for epoch in [5, 10, 15, 20, 25, 50, 100, 150]:
-#         for i, image in enumerate(val):
-#             dh = Dehaze(
-#                 [image],
-#                 [list_val_imgs[i]],
-#                 [list__val_gt_imgs[i]],
-#                 num_iter=num_iter,
-#                 clip=True,
-#                 use_gpu=use_gpu,
-#                 save_ambient_net=True,
-#                 save_image_net=True,
-#                 save_transmission_map=True,
-#                 path_save_nets=f"/{image}/{epoch}",
-#             )
-
-#             dh.load_weights(f"weights_4/weights_epoch_{epoch}.pth")
-#             dh.optimize()
-
-#             # I want to save the total loss, psnr, ssim in a dictionary
-
-#             total_loss = []
-#             ssim = []
-#             psnr = []
-#             for step in dh.storage_val_results:
-#                 total_loss.append(step["total_loss"])
-#                 ssim.append(step["ssim"])
-#                 psnr.append(step["psnr"])
-#             results[image] = {
-#                 "total_loss": total_loss,
-#                 "ssim": ssim,
-#                 "psnr": psnr,
-#             }
-
-#         # Now I want the mean of the total loss, psnr, ssim for all the images
-#         total_loss = np.array([])
-#         ssim = np.array([])
-#         psnr = np.array([])
-
-#         for key in results.keys():
-#             total_loss = np.append(total_loss, results[key]["total_loss"])
-#             ssim = np.append(ssim, results[key]["ssim"])
-#             psnr = np.append(psnr, results[key]["psnr"])
-
-#         train_results[epoch] = {
-#             "total_loss": np.mean(total_loss, axis=0),
-#             "ssim": np.mean(ssim, axis=0),
-#             "psnr": np.mean(psnr, axis=0),
-#         }
-
-#     # I want to plot the results
-#     for epoch in train_results.keys():
-#         fig = go.Figure()
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["total_loss"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#         fig.write_image(f"results/plot/inference_total_loss_epoch_{epoch}.png")
-
-#         fig = go.Figure()
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["ssim"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#         fig.write_image(f"results/plot/inference_ssim_epoch_{epoch}.png")
-
-#         fig = go.Figure()
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["psnr"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#         fig.write_image(f"results/plot/inference_psnr_epoch_{epoch}.png")
-
-#     fig = go.Figure()
-#     for epoch in train_results.keys():
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["total_loss"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#     fig.write_image("results/plot/inference_total_loss.png")
-
-#     fig = go.Figure()
-#     for epoch in train_results.keys():
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["ssim"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#     fig.write_image("results/plot/inference_ssim.png")
-
-#     fig = go.Figure()
-#     for epoch in train_results.keys():
-#         fig.add_trace(
-#             go.Scatter(
-#                 x=[i for i in range(num_iter)],
-#                 y=train_results[epoch]["psnr"],
-#                 mode="lines",
-#                 name=f"Epoch {epoch}",
-#             )
-#         )
-#     fig.write_image("results/plot/inference_psnr.png")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SZID Dehazing Script")
+    parser.add_argument("namein")
+    parser.add_argument("nameout")
     parser.add_argument(
         "--num_iter", type=int, default=200, help="Number of iterations"
     )
     parser.add_argument(
-        "--use_gpu", type=bool, default=False, help="Use GPU (True/False)"
+        "--use_gpu", type=bool, default=True, help="Use GPU (True/False)"
+    )
+    parser.add_argument(
+        "--path_weights",
+        type=str,
+        default=None,
+        help="Path to the weights",
     )
 
     args = parser.parse_args()
 
     num_iter = args.num_iter
     use_gpu = args.use_gpu
+    path_weights = args.path_weights
+    namein = args.namein
+    nameout = args.nameout
 
-    hazy_I_haze = os.listdir("I-HAZEsmall_copie/hazy/")
-    gt_I_haze = os.listdir("I-HAZEsmall_copie/GT/")
-    hazy_O_haze = os.listdir("O-HAZEsmall_copie/hazy/")
-    gt_O_haze = os.listdir("O-HAZEsmall_copie/GT/")
+    list_hazy_image = [prepare_hazy_image(namein)]
 
-    list_hazy_imgs_I_haze = []
-    list_gt_imgs_I_haze = []
-    list_hazy_imgs_O_haze = []
-    list_gt_imgs_O_haze = []
-
-    for image in hazy_I_haze:
-        list_hazy_imgs_I_haze.append(
-            prepare_hazy_image("I-HAZEsmall_copie/hazy/" + image)
-        )
-
-    for image in gt_I_haze:
-        list_gt_imgs_I_haze.append(
-            prepare_gt_img("I-HAZEsmall_copie/GT/" + image, SOTS=False)
-        )
-
-    for image in hazy_O_haze:
-        list_hazy_imgs_O_haze.append(
-            prepare_hazy_image("O-HAZEsmall_copie/hazy/" + image)
-        )
-
-    for image in gt_O_haze:
-        list_gt_imgs_O_haze.append(
-            prepare_gt_img("O-HAZEsmall_copie/GT/" + image, SOTS=False)
-        )
-
-    psnr_values_I_haze_hazy = []
-    ssim_values_I_haze_hazy = []
-    psnr_values_O_haze_hazy = []
-    ssim_values_O_haze_hazy = []
-    psnr_values_I_haze_new_method = []
-    ssim_values_I_haze_new_method = []
-    psnr_values_O_haze_new_method = []
-    ssim_values_O_haze_new_method = []
-    psnr_values_I_haze_original_method = []
-    ssim_values_I_haze_original_method = []
-    psnr_values_O_haze_original_method = []
-    ssim_values_O_haze_original_method = []
-
-    psnr_values_I_haze_new_method_final_image = []
-    ssim_values_I_haze_new_method_final_image = []
-    psnr_values_O_haze_new_method_final_image = []
-    ssim_values_O_haze_new_method_final_image = []
-    psnr_values_I_haze_original_method_final_image = []
-    ssim_values_I_haze_original_method_final_image = []
-    psnr_values_O_haze_original_method_final_image = []
-    ssim_values_O_haze_original_method_final_image = []
-
-    for i, image in tqdm(enumerate(hazy_I_haze)):
-        if list_gt_imgs_I_haze[i].size != list_hazy_imgs_I_haze[i].size:
-            logger.warning(
-                f"Image {image} number {i} has different size for GT and hazy image. Skipping this image."
-                f"GT size: {list_gt_imgs_O_haze[i].size}, Hazy size: {list_hazy_imgs_O_haze[i].size}"
-            )
-            continue
-        psnr = compare_psnr(list_gt_imgs_I_haze[i], list_hazy_imgs_I_haze[i])
-        ssim = compare_ssim(
-            list_gt_imgs_I_haze[i],
-            list_hazy_imgs_I_haze[i],
-            data_range=1.0,
-            channel_axis=0,
-        )
-        psnr_values_I_haze_hazy.append(psnr)
-        ssim_values_I_haze_hazy.append(ssim)
-        dehaze = Dehaze(
-            [image],
-            [list_hazy_imgs_I_haze[i]],
-            [list_gt_imgs_I_haze[i]],
-            num_iter=num_iter,
-            clip=True,
-            use_gpu=use_gpu,
-        )
-        dehaze.optimize()
-        psnr_values_I_haze_new_method.append(dehaze.storage_train_results[-1]["psnr"])
-        ssim_values_I_haze_new_method.append(dehaze.storage_train_results[-1]["ssim"])
-
-        dehaze.finalize()
-        dehazed_image = prepare_hazy_image(f"results/{image}_dehazed.png")
-        try:
-            psnr = compare_psnr(list_gt_imgs_I_haze[i], dehazed_image)
-            ssim = compare_ssim(
-                list_gt_imgs_I_haze[i],
-                dehazed_image,
-                data_range=1.0,
-                channel_axis=0,
-            )
-            psnr_values_I_haze_new_method_final_image.append(psnr)
-            ssim_values_I_haze_new_method_final_image.append(ssim)
-        except Exception as e:
-            logger.info(
-                f"Shape gt image: {list_gt_imgs_I_haze[i].shape}, shape hazy image: {list_hazy_imgs_I_haze[i].shape}"
-            )
-            continue
-
-    for i, image in tqdm(enumerate(hazy_O_haze)):
-        if list_gt_imgs_O_haze[i].size != list_hazy_imgs_O_haze[i].size:
-            logger.warning(
-                f"Image {image} number {i} has different size for GT and hazy image. Skipping this image."
-                f"GT size: {list_gt_imgs_O_haze[i].size}, Hazy size: {list_hazy_imgs_O_haze[i].size}"
-            )
-        else:
-            try:
-                psnr = compare_psnr(list_gt_imgs_O_haze[i], list_hazy_imgs_O_haze[i])
-            except Exception as e:
-                logger.info(
-                    f"Shape gt image: {list_gt_imgs_O_haze[i].shape}, shape hazy image: {list_hazy_imgs_O_haze[i].shape}"
-                )
-                continue
-            ssim = compare_ssim(
-                list_gt_imgs_O_haze[i],
-                list_hazy_imgs_O_haze[i],
-                data_range=1.0,
-                channel_axis=0,
-            )
-            psnr_values_O_haze_hazy.append(psnr)
-            ssim_values_O_haze_hazy.append(ssim)
-            dehaze = Dehaze(
-                [image],
-                [list_hazy_imgs_O_haze[i]],
-                [list_gt_imgs_O_haze[i]],
-                num_iter=num_iter,
-                clip=True,
-                use_gpu=use_gpu,
-            )
-            dehaze.optimize()
-            psnr_values_O_haze_new_method.append(
-                dehaze.storage_train_results[-1]["psnr"]
-            )
-            ssim_values_O_haze_new_method.append(
-                dehaze.storage_train_results[-1]["ssim"]
-            )
-
-            dehaze.finalize()
-            dehazed_image = prepare_hazy_image(f"results/{image}_dehazed.png")
-            try:
-                psnr = compare_psnr(list_gt_imgs_O_haze[i], dehazed_image)
-                ssim = compare_ssim(
-                    list_gt_imgs_O_haze[i],
-                    dehazed_image,
-                    data_range=1.0,
-                    channel_axis=0,
-                )
-                psnr_values_O_haze_new_method_final_image.append(psnr)
-                ssim_values_O_haze_new_method_final_image.append(ssim)
-            except Exception as e:
-                logger.info(
-                    f"Shape gt image: {list_gt_imgs_O_haze[i].shape}, shape hazy image: {list_hazy_imgs_O_haze[i].shape}"
-                )
-                continue
-
-    for i, image in tqdm(enumerate(hazy_I_haze)):
-        if list_gt_imgs_I_haze[i].size != list_hazy_imgs_I_haze[i].size:
-            logger.warning(
-                f"Image {image} number {i} has different size for GT and hazy image. Skipping this image."
-                f"GT size: {list_gt_imgs_O_haze[i].size}, Hazy size: {list_hazy_imgs_O_haze[i].size}"
-            )
-            continue
-        dehaze = Dehaze(
-            [image],
-            [list_hazy_imgs_I_haze[i]],
-            [list_gt_imgs_I_haze[i]],
-            num_iter=num_iter,
-            clip=True,
-            use_gpu=use_gpu,
-            original_method=True,
-        )
-        dehaze.optimize()
-        psnr_values_I_haze_original_method.append(
-            dehaze.storage_train_results[-1]["psnr"]
-        )
-        ssim_values_I_haze_original_method.append(
-            dehaze.storage_train_results[-1]["ssim"]
-        )
-
-        dehaze.finalize()
-        dehazed_image = prepare_hazy_image(f"results/{image}_dehazed.png")
-
-        try:
-            psnr = compare_psnr(list_gt_imgs_I_haze[i], dehazed_image)
-            ssim = compare_ssim(
-                list_gt_imgs_I_haze[i],
-                dehazed_image,
-                data_range=1.0,
-                channel_axis=0,
-            )
-            psnr_values_I_haze_original_method_final_image.append(psnr)
-            ssim_values_I_haze_original_method_final_image.append(ssim)
-        except Exception as e:
-            logger.info(
-                f"Shape gt image: {list_gt_imgs_I_haze[i].shape}, shape hazy image: {list_hazy_imgs_I_haze[i].shape}"
-            )
-            continue
-
-    for i, image in tqdm(enumerate(hazy_O_haze)):
-        if list_gt_imgs_O_haze[i].size != list_hazy_imgs_O_haze[i].size:
-            logger.warning(
-                f"Image {image} number {i} has different size for GT and hazy image. Skipping this image."
-                f"GT size: {list_gt_imgs_O_haze[i].size}, Hazy size: {list_hazy_imgs_O_haze[i].size}"
-            )
-            continue
-        else:
-            dehaze = Dehaze(
-                [image],
-                [list_hazy_imgs_O_haze[i]],
-                [list_gt_imgs_O_haze[i]],
-                num_iter=num_iter,
-                clip=True,
-                use_gpu=use_gpu,
-                original_method=True,
-            )
-            dehaze.optimize()
-            psnr_values_O_haze_original_method.append(
-                dehaze.storage_train_results[-1]["psnr"]
-            )
-            ssim_values_O_haze_original_method.append(
-                dehaze.storage_train_results[-1]["ssim"]
-            )
-
-            dehaze.finalize()
-            dehazed_image = prepare_hazy_image(f"results/{image}_dehazed.png")
-
-            try:
-                psnr = compare_psnr(list_gt_imgs_O_haze[i], dehazed_image)
-                ssim = compare_ssim(
-                    list_gt_imgs_O_haze[i],
-                    dehazed_image,
-                    data_range=1.0,
-                    channel_axis=0,
-                )
-                psnr_values_O_haze_original_method_final_image.append(psnr)
-                ssim_values_O_haze_original_method_final_image.append(ssim)
-            except Exception as e:
-                logger.info(
-                    f"Shape gt image: {list_gt_imgs_O_haze[i].shape}, shape hazy image: {list_hazy_imgs_O_haze[i].shape}"
-                )
-                continue
-
-    mean_psnr_I_haze_hazy = np.mean(
-        [psnr for psnr in psnr_values_I_haze_hazy if psnr is not None]
+    dehaze = Dehaze(
+        list_image_name=[nameout],
+        list_image=list_hazy_image,
+        num_iter=num_iter,
+        use_gpu=use_gpu,
     )
-    mean_ssim_I_haze_hazy = np.mean(
-        [ssim for ssim in ssim_values_I_haze_hazy if ssim is not None]
-    )
-    mean_psnr_O_haze_hazy = np.mean(
-        [psnr for psnr in psnr_values_O_haze_hazy if psnr is not None]
-    )
-    mean_ssim_O_haze_hazy = np.mean(
-        [ssim for ssim in ssim_values_O_haze_hazy if ssim is not None]
-    )
-    mean_psnr_I_haze_new_method = np.mean(
-        [psnr for psnr in psnr_values_I_haze_new_method if psnr is not None]
-    )
-    mean_ssim_I_haze_new_method = np.mean(
-        [ssim for ssim in ssim_values_I_haze_new_method if ssim is not None]
-    )
-    mean_psnr_O_haze_new_method = np.mean(
-        [psnr for psnr in psnr_values_O_haze_new_method if psnr is not None]
-    )
-    mean_ssim_O_haze_new_method = np.mean(
-        [ssim for ssim in ssim_values_O_haze_new_method if ssim is not None]
-    )
-    mean_psnr_I_haze_original_method = np.mean(
-        [psnr for psnr in psnr_values_I_haze_original_method if psnr is not None]
-    )
-    mean_ssim_I_haze_original_method = np.mean(
-        [ssim for ssim in ssim_values_I_haze_original_method if ssim is not None]
-    )
-    mean_psnr_O_haze_original_method = np.mean(
-        [psnr for psnr in psnr_values_O_haze_original_method if psnr is not None]
-    )
-    mean_ssim_O_haze_original_method = np.mean(
-        [ssim for ssim in ssim_values_O_haze_original_method if ssim is not None]
-    )
-    mean_psnr_I_haze_new_method_final_image = np.mean(
-        [psnr for psnr in psnr_values_I_haze_new_method_final_image if psnr is not None]
-    )
-    mean_ssim_I_haze_new_method_final_image = np.mean(
-        [ssim for ssim in ssim_values_I_haze_new_method_final_image if ssim is not None]
-    )
-    mean_psnr_O_haze_new_method_final_image = np.mean(
-        [psnr for psnr in psnr_values_O_haze_new_method_final_image if psnr is not None]
-    )
-    mean_ssim_O_haze_new_method_final_image = np.mean(
-        [ssim for ssim in ssim_values_O_haze_new_method_final_image if ssim is not None]
-    )
-    mean_psnr_I_haze_original_method_final_image = np.mean(
-        [
-            psnr
-            for psnr in psnr_values_I_haze_original_method_final_image
-            if psnr is not None
-        ]
-    )
-    mean_ssim_I_haze_original_method_final_image = np.mean(
-        [
-            ssim
-            for ssim in ssim_values_I_haze_original_method_final_image
-            if ssim is not None
-        ]
-    )
-    mean_psnr_O_haze_original_method_final_image = np.mean(
-        [
-            psnr
-            for psnr in psnr_values_O_haze_original_method_final_image
-            if psnr is not None
-        ]
-    )
-    mean_ssim_O_haze_original_method_final_image = np.mean(
-        [
-            ssim
-            for ssim in ssim_values_O_haze_original_method_final_image
-            if ssim is not None
-        ]
-    )
-
-    print(
-        f"Mean PSNR I-HAZE New Method: {mean_psnr_I_haze_new_method}, Mean SSIM I-HAZE New Method: {mean_ssim_I_haze_new_method}"
-    )
-    print(
-        f"Mean PSNR O-HAZE New Method: {mean_psnr_O_haze_new_method}, Mean SSIM O-HAZE New Method: {mean_ssim_O_haze_new_method}"
-    )
-    print(
-        f"Mean PSNR I-HAZE Original Method: {mean_psnr_I_haze_original_method}, Mean SSIM I-HAZE Original Method: {mean_ssim_I_haze_original_method}"
-    )
-    print(
-        f"Mean PSNR O-HAZE Original Method: {mean_psnr_O_haze_original_method}, Mean SSIM O-HAZE Original Method: {mean_ssim_O_haze_original_method}"
-    )
-
-    import plotly.graph_objects as go
-
-    # Create a table with the PSNR and SSIM values
-    table_data = [
-        ["Method", "Mean PSNR", "Mean SSIM"],
-        ["I-HAZE New Method", mean_psnr_I_haze_new_method, mean_ssim_I_haze_new_method],
-        ["O-HAZE New Method", mean_psnr_O_haze_new_method, mean_ssim_O_haze_new_method],
-        [
-            "I-HAZE Original Method",
-            mean_psnr_I_haze_original_method,
-            mean_ssim_I_haze_original_method,
-        ],
-        [
-            "O-HAZE Original Method",
-            mean_psnr_O_haze_original_method,
-            mean_ssim_O_haze_original_method,
-        ],
-        [
-            "I-HAZE Hazy",
-            mean_psnr_I_haze_hazy,
-            mean_ssim_I_haze_hazy,
-        ],
-        [
-            "O-HAZE Hazy",
-            mean_psnr_O_haze_hazy,
-            mean_ssim_O_haze_hazy,
-        ],
-        [
-            "I-HAZE New Method Final Image",
-            mean_psnr_I_haze_new_method_final_image,
-            mean_ssim_I_haze_new_method_final_image,
-        ],
-        [
-            "O-HAZE New Method Final Image",
-            mean_psnr_O_haze_new_method_final_image,
-            mean_ssim_O_haze_new_method_final_image,
-        ],
-        [
-            "I-HAZE Original Method Final Image",
-            mean_psnr_I_haze_original_method_final_image,
-            mean_ssim_I_haze_original_method_final_image,
-        ],
-        [
-            "O-HAZE Original Method Final Image",
-            mean_psnr_O_haze_original_method_final_image,
-            mean_ssim_O_haze_original_method_final_image,
-        ],
-    ]
-
-    fig = go.Figure(
-        data=[
-            go.Table(
-                header=dict(
-                    values=["Method", "Mean PSNR", "Mean SSIM"],
-                    fill_color="paleturquoise",
-                    align="left",
-                ),
-                cells=dict(
-                    values=list(zip(*table_data[1:])),  # Transpose the data for cells
-                    fill_color="lavender",
-                    align="left",
-                ),
-            )
-        ]
-    )
-
-    import os
-
-    # Create the directory if it doesn't exist
-    os.makedirs("results/table", exist_ok=True)
-
-    # Save the figure as a PNG file
-    fig.write_image("results/table/dehazing_results.png")
-
-    logger.info(
-        f"Number of images used: {len([psnr for psnr in psnr_values_I_haze_new_method if psnr is not None])}"
-    )
-    logger.info(
-        f"Number of images used: {len([psnr for psnr in psnr_values_O_haze_new_method if psnr is not None])}"
-    )
+    if path_weights is not None:
+        dehaze.load_weights(path_weights)
+    dehaze.optimize()
+    dehaze.finalize()
